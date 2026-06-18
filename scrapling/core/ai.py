@@ -338,6 +338,9 @@ class ScraplingMCPServer:
         block_webrtc: bool = True,
         dismiss_overlays: bool = True,
         lazy_scroll: bool = True,
+        wait_for_images: bool = True,
+        hide_sticky: bool = True,
+        element_selector: Optional[str] = None,
         proxy: Optional[str | Dict[str, str]] = None,
         timeout: int | float = 60000,
         wait_selector: Optional[str] = None,
@@ -345,12 +348,13 @@ class ScraplingMCPServer:
     ) -> List[ImageContent | TextContent]:
         """One-shot stealthy screenshot — no session management needed.
         Opens a hardened stealth browser, optionally scrolls to trigger lazy-loaded images,
-        dismisses common cookie/overlay banners, then captures and returns the screenshot.
+        dismisses common cookie/overlay banners, waits for all images to finish loading,
+        hides sticky headers/footers, then captures and returns the screenshot.
         Best for visual scraping on protected, JS-heavy, or Cloudflare-protected sites.
 
         :param url: The URL to navigate to and capture.
         :param image_type: Image format: "png" (lossless, default) or "jpeg" (smaller file).
-        :param full_page: Capture the full scrollable page, not just the visible viewport. Defaults to True.
+        :param full_page: Capture the full scrollable page, not just the visible viewport. Defaults to True. Ignored when element_selector is set.
         :param quality: JPEG quality 0–100. Only valid when image_type="jpeg".
         :param wait: Milliseconds to wait after page load before capturing. Defaults to 1500.
         :param network_idle: Wait until no network activity for 500ms before capturing. Defaults to True.
@@ -359,6 +363,9 @@ class ScraplingMCPServer:
         :param block_webrtc: Block WebRTC to prevent local IP address leaks. Defaults to True.
         :param dismiss_overlays: Inject JS to hide common cookie banners and modal popups before capture. Defaults to True.
         :param lazy_scroll: Slowly scroll to bottom and back before capture to trigger lazy-loaded images. Defaults to True.
+        :param wait_for_images: Wait for all <img> elements to finish loading before capturing. Defaults to True.
+        :param hide_sticky: Hide position:fixed and position:sticky elements (headers, footbars, chat widgets) before capture. Defaults to True.
+        :param element_selector: CSS selector for a specific element to screenshot instead of the full page. When set, full_page is ignored.
         :param proxy: Proxy URL or dict with 'server', 'username', 'password' keys.
         :param timeout: Operation timeout in milliseconds. Defaults to 60,000 (60s, allows time for Cloudflare solve).
         :param wait_selector: CSS selector to wait for before capturing.
@@ -404,8 +411,35 @@ async () => {
 }
 """
 
+        _WAIT_IMAGES_JS = """
+async () => {
+    const images = Array.from(document.querySelectorAll('img[src], img[srcset]'));
+    await Promise.all(images.map(img => {
+        if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+        return new Promise(resolve => {
+            img.addEventListener('load', resolve, {once: true});
+            img.addEventListener('error', resolve, {once: true});
+            setTimeout(resolve, 5000);
+        });
+    }));
+}
+"""
+
+        _HIDE_STICKY_JS = """
+Array.from(document.querySelectorAll('*')).forEach(el => {
+    try {
+        const pos = window.getComputedStyle(el).position;
+        if (pos === 'fixed' || pos === 'sticky') {
+            el.style.setProperty('display', 'none', 'important');
+        }
+    } catch(_) {}
+});
+"""
+
         captured: Dict[str, Any] = {}
-        screenshot_kwargs: Dict[str, Any] = {"type": image_type, "full_page": full_page}
+        screenshot_kwargs: Dict[str, Any] = {"type": image_type}
+        if not element_selector:
+            screenshot_kwargs["full_page"] = full_page
         if quality is not None:
             screenshot_kwargs["quality"] = quality
 
@@ -416,7 +450,16 @@ async () => {
                 if lazy_scroll:
                     await page.evaluate(_LAZY_SCROLL_JS)
                     await page.wait_for_timeout(500)
-                captured["bytes"] = await page.screenshot(**screenshot_kwargs)
+                if wait_for_images:
+                    await page.evaluate(_WAIT_IMAGES_JS)
+                if hide_sticky:
+                    await page.evaluate(_HIDE_STICKY_JS)
+                if element_selector:
+                    locator = page.locator(element_selector).first
+                    await locator.wait_for(state="visible")
+                    captured["bytes"] = await locator.screenshot(**screenshot_kwargs)
+                else:
+                    captured["bytes"] = await page.screenshot(**screenshot_kwargs)
                 captured["url"] = page.url
             except Exception as exc:
                 captured["error"] = exc
