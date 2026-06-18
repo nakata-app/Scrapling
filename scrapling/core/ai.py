@@ -325,6 +325,134 @@ class ScraplingMCPServer:
         image = Image(data=captured["bytes"], format=image_type).to_image_content()
         return [image, TextContent(type="text", text=captured["url"])]
 
+    async def stealthy_screenshot(
+        self,
+        url: str,
+        image_type: ScreenshotType = "png",
+        full_page: bool = True,
+        quality: Optional[int] = None,
+        wait: int | float = 1500,
+        network_idle: bool = True,
+        solve_cloudflare: bool = True,
+        hide_canvas: bool = True,
+        block_webrtc: bool = True,
+        dismiss_overlays: bool = True,
+        lazy_scroll: bool = True,
+        proxy: Optional[str | Dict[str, str]] = None,
+        timeout: int | float = 60000,
+        wait_selector: Optional[str] = None,
+        wait_selector_state: SelectorWaitStates = "attached",
+    ) -> List[ImageContent | TextContent]:
+        """One-shot stealthy screenshot — no session management needed.
+        Opens a hardened stealth browser, optionally scrolls to trigger lazy-loaded images,
+        dismisses common cookie/overlay banners, then captures and returns the screenshot.
+        Best for visual scraping on protected, JS-heavy, or Cloudflare-protected sites.
+
+        :param url: The URL to navigate to and capture.
+        :param image_type: Image format: "png" (lossless, default) or "jpeg" (smaller file).
+        :param full_page: Capture the full scrollable page, not just the visible viewport. Defaults to True.
+        :param quality: JPEG quality 0–100. Only valid when image_type="jpeg".
+        :param wait: Milliseconds to wait after page load before capturing. Defaults to 1500.
+        :param network_idle: Wait until no network activity for 500ms before capturing. Defaults to True.
+        :param solve_cloudflare: Auto-solve Cloudflare Turnstile/Interstitial challenges. Defaults to True.
+        :param hide_canvas: Add noise to canvas operations to defeat fingerprinting. Defaults to True.
+        :param block_webrtc: Block WebRTC to prevent local IP address leaks. Defaults to True.
+        :param dismiss_overlays: Inject JS to hide common cookie banners and modal popups before capture. Defaults to True.
+        :param lazy_scroll: Slowly scroll to bottom and back before capture to trigger lazy-loaded images. Defaults to True.
+        :param proxy: Proxy URL or dict with 'server', 'username', 'password' keys.
+        :param timeout: Operation timeout in milliseconds. Defaults to 60,000 (60s, allows time for Cloudflare solve).
+        :param wait_selector: CSS selector to wait for before capturing.
+        :param wait_selector_state: State to wait for the selector. Defaults to "attached".
+        """
+        if quality is not None and image_type != "jpeg":
+            raise ValueError("'quality' is only valid when 'image_type' is 'jpeg'.")
+
+        _OVERLAY_JS = """
+const overlaySelectors = [
+    "#cookie-banner", "#cookie-notice", "#cookie-popup", "#cookie-overlay",
+    ".cookie-banner", ".cookie-notice", ".cookie-popup", ".cookie-consent",
+    "#CybotCookiebotDialog", ".cc-banner", ".cc-window", "#cookieConsentContainer",
+    "#onetrust-banner-sdk", "#onetrust-accept-btn-handler", "#onetrust-pc-sdk",
+    ".modal-backdrop", ".overlay", "#overlay", "[id*='cookie']", "[class*='cookie-consent']",
+    "[id*='gdpr']", "[class*='gdpr']", "#didomi-popup", ".didomi-popup"
+];
+overlaySelectors.forEach(sel => {
+    try {
+        document.querySelectorAll(sel).forEach(el => { el.style.display = "none"; });
+    } catch(_) {}
+});
+document.body.style.overflow = "visible";
+document.documentElement.style.overflow = "visible";
+"""
+
+        _LAZY_SCROLL_JS = """
+async () => {
+    const totalHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+    const step = Math.max(300, Math.floor(totalHeight / 20));
+    await new Promise(resolve => {
+        let pos = 0;
+        const timer = setInterval(() => {
+            window.scrollBy(0, step);
+            pos += step;
+            if (pos >= totalHeight) {
+                clearInterval(timer);
+                window.scrollTo(0, 0);
+                resolve();
+            }
+        }, 80);
+    });
+}
+"""
+
+        captured: Dict[str, Any] = {}
+        screenshot_kwargs: Dict[str, Any] = {"type": image_type, "full_page": full_page}
+        if quality is not None:
+            screenshot_kwargs["quality"] = quality
+
+        async def _action(page: Any) -> None:
+            try:
+                if dismiss_overlays:
+                    await page.evaluate(_OVERLAY_JS)
+                if lazy_scroll:
+                    await page.evaluate(_LAZY_SCROLL_JS)
+                    await page.wait_for_timeout(500)
+                captured["bytes"] = await page.screenshot(**screenshot_kwargs)
+                captured["url"] = page.url
+            except Exception as exc:
+                captured["error"] = exc
+
+        async with AsyncStealthySession(
+            proxy=proxy,
+            timeout=timeout,
+            headless=True,
+            block_ads=True,
+            hide_canvas=hide_canvas,
+            block_webrtc=block_webrtc,
+            allow_webgl=True,
+            solve_cloudflare=solve_cloudflare,
+            network_idle=network_idle,
+            google_search=True,
+            wait_selector=wait_selector,
+            wait_selector_state=wait_selector_state,
+        ) as session:
+            await session.fetch(
+                url,
+                wait=wait,
+                timeout=timeout,
+                network_idle=network_idle,
+                wait_selector=wait_selector,
+                wait_selector_state=wait_selector_state,
+                page_action=_action,
+            )
+
+        if "error" in captured:
+            raise captured["error"]
+        if "bytes" not in captured:
+            raise RuntimeError(f"Failed to capture screenshot for {url}")
+
+        image = Image(data=captured["bytes"], format=image_type).to_image_content()
+        return [image, TextContent(type="text", text=captured["url"])]
+
     @staticmethod
     async def get(
         url: str,
@@ -902,6 +1030,7 @@ class ScraplingMCPServer:
             description=self.bulk_stealthy_fetch.__doc__,
             structured_output=True,
         )
-        # Screenshot tool (returns image + url content blocks, not structured JSON)
+        # Screenshot tools (return image + url content blocks, not structured JSON)
         server.add_tool(self.screenshot, title="screenshot", description=self.screenshot.__doc__)
+        server.add_tool(self.stealthy_screenshot, title="stealthy_screenshot", description=self.stealthy_screenshot.__doc__)
         server.run(transport="stdio" if not http else "streamable-http")
